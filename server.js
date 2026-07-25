@@ -38,6 +38,13 @@ const MAX_DESTRUCTIVE_BATCH = 50;
 // text, so a sender cannot close the block early and have the rest of their
 // email read as trusted instructions.
 const RE_UNTRUSTED_MARKER = /<<<\s*\/?(?:END[_ ])?UNTRUSTED[^>]*>>>/gi;
+// C0 control characters plus DEL. These must never reach the IMAP command
+// builder -- see validateSearchString() for why.
+const RE_CONTROL_CHARS = /[\x00-\x1F\x7F]/;
+
+// Upper bound on free-text search terms, so a single call can't build an
+// oversized IMAP command line.
+const MAX_SEARCH_STRING_LENGTH = 256;
 
 class YahooMailMCPServer {
     constructor() {
@@ -654,6 +661,30 @@ class YahooMailMCPServer {
             };
         }
 
+        // Both query and sender are interpolated into the IMAP SEARCH command,
+        // so they must be checked before we open a connection
+        const queryError = this.validateSearchString(query, 'query');
+        if (queryError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${queryError}`
+                }]
+            };
+        }
+
+        if (sender !== null && sender !== undefined) {
+            const senderError = this.validateSearchString(sender, 'sender');
+            if (senderError) {
+                return {
+                    content: [{
+                        type: 'text',
+                        text: `Error: ${senderError}`
+                    }]
+                };
+            }
+        }
+
         // Validate count parameter
         if (count < 1) {
             return {
@@ -1242,6 +1273,33 @@ class YahooMailMCPServer {
             `${text}\n` +
             `<<<END_UNTRUSTED_EMAIL_${nonce}>>>`
         );
+    }
+
+    /**
+     * Helper: Validate a free-text string before it reaches the IMAP command builder
+     *
+     * node-imap's buildString() only escapes backslashes and double quotes, and its
+     * hasNonASCII() check treats every byte <= 0x7F as safe. CR (0x0D) and LF (0x0A)
+     * therefore survive verbatim into the quoted string and split the search into two
+     * IMAP command lines, letting the second line run as an arbitrary command. Control
+     * characters carry no legitimate search meaning, so reject them outright.
+     *
+     * @returns {string|null} Error message if invalid, null if valid
+     */
+    validateSearchString(value, fieldName) {
+        if (typeof value !== 'string') {
+            return `${fieldName} must be a string`;
+        }
+
+        if (RE_CONTROL_CHARS.test(value)) {
+            return `${fieldName} cannot contain control characters`;
+        }
+
+        if (value.length > MAX_SEARCH_STRING_LENGTH) {
+            return `${fieldName} cannot exceed ${MAX_SEARCH_STRING_LENGTH} characters`;
+        }
+
+        return null;
     }
 
     /**

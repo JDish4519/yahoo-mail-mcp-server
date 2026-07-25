@@ -1483,6 +1483,9 @@ class YahooMailMCPServer {
         const app = express();
         const port = process.env.PORT || 3000;
 
+        // Don't advertise the framework in every response header
+        app.disable('x-powered-by');
+
         // Log startup configuration
         console.error('[Server] Starting in SSE mode');
         console.error('[Server] Port:', port);
@@ -1896,8 +1899,17 @@ class YahooMailMCPServer {
             });
         });
 
-        // Health check endpoint (enhanced with environment info)
+        // Health check endpoint. Unauthenticated, so it says only what a load
+        // balancer needs. Runtime version, platform and whether credentials are
+        // configured are all useful to an attacker choosing which exploits to try,
+        // and useful to nobody else. The detail moved to /diagnostics, behind auth.
         app.get('/health', (req, res) => {
+            res.json({ status: 'ok' });
+        });
+
+        // Operator diagnostics. Not in the authenticateMCP skip list, so it requires
+        // a valid Bearer token.
+        app.get('/diagnostics', (req, res) => {
             res.json({
                 status: 'ok',
                 service: 'yahoo-mail-mcp',
@@ -1973,39 +1985,22 @@ class YahooMailMCPServer {
             }
         });
 
-        // Error handling middleware
+        // Error handling middleware. The exception message can carry paths, library
+        // internals and stack detail, so it stays in the server log rather than
+        // going back to the caller.
         app.use((err, req, res, next) => {
             console.error('[Express] Error:', err);
             res.status(500).json({
-                error: 'Internal server error',
-                message: err.message
+                error: 'Internal server error'
             });
         });
 
-        // Root endpoint
+        // Root endpoint. Also unauthenticated. It used to publish the version and
+        // the full tool list, which told an unauthenticated scanner that this host
+        // reaches a mailbox and can delete from it. Authenticated clients get the
+        // real inventory from tools/list over MCP.
         app.get('/', (req, res) => {
-            res.json({
-                name: 'Yahoo Mail MCP Server',
-                version: '3.0.0',
-                description: 'MCP server for Yahoo Mail access via IMAP',
-                endpoints: {
-                    health: '/health',
-                    sse: '/mcp/sse',
-                    message: '/mcp/message'
-                },
-                tools: [
-                    'list_emails',
-                    'read_email',
-                    'search_emails',
-                    'delete_emails',
-                    'archive_emails',
-                    'mark_as_read',
-                    'mark_as_unread',
-                    'flag_emails',
-                    'unflag_emails',
-                    'move_emails'
-                ]
-            });
+            res.json({ name: 'Yahoo Mail MCP Server' });
         });
 
         // Expired entries are also rejected on use; this just stops the maps from

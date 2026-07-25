@@ -14,9 +14,21 @@ import { simpleParser } from 'mailparser';
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import crypto from 'crypto';
 
 // Load environment variables from .env file (for local development)
 dotenv.config();
+
+// OAuth lifetimes. Access tokens must match the expires_in we advertise, or
+// clients will keep using tokens the server has already stopped honouring.
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;             // 1 hour
+const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;  // 30 days
+const AUTH_CODE_TTL_MS = 5 * 60 * 1000;                 // RFC 6749 caps this at 10 minutes
+const EXPIRY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+
+// Hosts allowed as OAuth redirect targets. Matched against the parsed hostname,
+// never with substring tests -- "evil.com/?x=claude.ai" must not pass.
+const ALLOWED_REDIRECT_HOSTS = ['claude.ai', 'claude.com'];
 
 class YahooMailMCPServer {
     constructor() {
@@ -36,15 +48,16 @@ class YahooMailMCPServer {
         this.transports = new Map();
 
         // Store valid OAuth access tokens (in-memory)
+        // Maps access_token -> { client_id, scope, expiresAt }
         // In production, use Redis or a database with TTL
-        this.validTokens = new Set();
+        this.validTokens = new Map();
 
         // Store authorization codes for OAuth authorization code flow
-        // In production, use Redis with short TTL (60 seconds)
+        // Maps code -> { client_id, redirect_uri, code_challenge, scope, expiresAt }
         this.authCodes = new Map();
 
         // Store valid OAuth refresh tokens (in-memory)
-        // Maps refresh_token -> { client_id, scope }. In production, use Redis or a database.
+        // Maps refresh_token -> { client_id, scope, expiresAt }. In production, use Redis or a database.
         this.validRefreshTokens = new Map();
 
         this.setupToolHandlers();
@@ -1226,6 +1239,94 @@ class YahooMailMCPServer {
         });
     }
 
+    /**
+     * Helper: Compare two secrets without leaking their contents through timing
+     */
+    constantTimeEquals(a, b) {
+        const bufA = Buffer.from(String(a ?? ''), 'utf8');
+        const bufB = Buffer.from(String(b ?? ''), 'utf8');
+
+        // timingSafeEqual throws on length mismatch, and the length itself is not
+        // the secret, so compare it up front.
+        if (bufA.length !== bufB.length) {
+            return false;
+        }
+
+        return crypto.timingSafeEqual(bufA, bufB);
+    }
+
+    /**
+     * Helper: Decide whether an OAuth redirect_uri may be redirected to
+     *
+     * Substring matching is not sufficient here: "https://evil.com/?x=claude.ai"
+     * and "https://claude.ai.evil.com/cb" both contain "claude.ai". Parse the URL
+     * and compare the hostname itself.
+     */
+    isRedirectUriAllowed(redirectUri) {
+        let url;
+        try {
+            url = new URL(redirectUri);
+        } catch {
+            return false;
+        }
+
+        const isLocalhost = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+
+        // Codes must not travel over cleartext, except to a local dev callback
+        if (url.protocol !== 'https:' && !(isLocalhost && url.protocol === 'http:')) {
+            return false;
+        }
+
+        if (isLocalhost) {
+            return true;
+        }
+
+        return ALLOWED_REDIRECT_HOSTS.some(
+            (host) => url.hostname === host || url.hostname.endsWith(`.${host}`)
+        );
+    }
+
+    /**
+     * Helper: Mint an access token that actually stops working when it expires
+     */
+    issueAccessToken(clientId, scope) {
+        const token = crypto.randomBytes(32).toString('base64url');
+        this.validTokens.set(token, {
+            client_id: clientId,
+            scope: scope || 'mcp',
+            expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS
+        });
+        return token;
+    }
+
+    /**
+     * Helper: Mint a refresh token
+     */
+    issueRefreshToken(clientId, scope) {
+        const token = crypto.randomBytes(32).toString('base64url');
+        this.validRefreshTokens.set(token, {
+            client_id: clientId,
+            scope: scope || 'mcp',
+            expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS
+        });
+        return token;
+    }
+
+    /**
+     * Helper: Drop expired tokens and codes so they cannot be replayed and the
+     * maps do not grow without bound
+     */
+    pruneExpiredOAuthState() {
+        const now = Date.now();
+        for (const store of [this.validTokens, this.validRefreshTokens, this.authCodes]) {
+            for (const [key, entry] of store) {
+                if (!entry || entry.expiresAt <= now) {
+                    store.delete(key);
+                }
+            }
+        }
+    }
+
     setupErrorHandling() {
         this.server.onerror = (error) => {
             console.error('[MCP Error]', error);
@@ -1334,9 +1435,21 @@ class YahooMailMCPServer {
 
             const token = authHeader.substring(7); // Remove 'Bearer ' prefix
 
-            // Validate token (check if it's in our valid tokens set)
-            if (!this.validTokens || !this.validTokens.has(token)) {
-                console.error('[Auth] Invalid or expired access token');
+            // Validate token and enforce its lifetime. Without the expiry check the
+            // advertised expires_in is decorative and every token ever issued stays
+            // usable until the process restarts.
+            const tokenData = this.validTokens.get(token);
+            if (!tokenData) {
+                console.error('[Auth] Invalid access token');
+                return res.status(401).json({
+                    error: 'invalid_token',
+                    error_description: 'The access token is invalid or has expired'
+                });
+            }
+
+            if (tokenData.expiresAt <= Date.now()) {
+                this.validTokens.delete(token);
+                console.error('[Auth] Expired access token rejected');
                 return res.status(401).json({
                     error: 'invalid_token',
                     error_description: 'The access token is invalid or has expired'
@@ -1432,23 +1545,34 @@ class YahooMailMCPServer {
             }
 
             // Validate redirect_uri (must be Claude's callback)
-            if (!redirect_uri || (!redirect_uri.includes('claude.ai') && !redirect_uri.includes('claude.com') && !redirect_uri.includes('localhost'))) {
+            if (!redirect_uri || !this.isRedirectUriAllowed(redirect_uri)) {
                 console.error('[OAuth] Invalid redirect_uri:', redirect_uri);
                 return res.status(400).send('Invalid redirect_uri');
             }
 
+            // Require PKCE. Treating it as optional lets an attacker skip the check
+            // entirely just by omitting code_challenge from the request.
+            if (!code_challenge) {
+                console.error('[OAuth] Rejected authorize request without PKCE challenge');
+                return res.status(400).send('code_challenge is required');
+            }
+
+            if (code_challenge_method !== 'S256') {
+                console.error('[OAuth] Unsupported code_challenge_method:', code_challenge_method);
+                return res.status(400).send('code_challenge_method must be S256');
+            }
+
             // Generate authorization code
-            const authCode = Buffer.from(`${client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+            const authCode = crypto.randomBytes(32).toString('base64url');
 
             // Store auth code with PKCE challenge (in-memory - use Redis/DB in production)
-            if (!this.authCodes) this.authCodes = new Map();
             this.authCodes.set(authCode, {
                 client_id,
                 redirect_uri,
                 code_challenge,
                 code_challenge_method,
                 scope,
-                created_at: Date.now()
+                expiresAt: Date.now() + AUTH_CODE_TTL_MS
             });
 
             console.error('[OAuth] Authorization code generated, redirecting to:', redirect_uri);
@@ -1488,8 +1612,11 @@ class YahooMailMCPServer {
                 reqClientSecret = req.body?.client_secret;
             }
 
-            // Validate credentials
-            if (reqClientId !== clientId || reqClientSecret !== clientSecret) {
+            // Validate credentials. Compare in constant time so response latency
+            // cannot be used to recover the secret byte by byte.
+            const clientIdOk = this.constantTimeEquals(reqClientId, clientId);
+            const clientSecretOk = this.constantTimeEquals(reqClientSecret, clientSecret);
+            if (!clientIdOk || !clientSecretOk) {
                 console.error('[OAuth] Authentication failed - invalid client credentials');
                 return res.status(401).json({
                     error: 'invalid_client',
@@ -1506,7 +1633,8 @@ class YahooMailMCPServer {
                 console.error('[OAuth] Authorization code grant - validating code');
 
                 // Validate authorization code
-                if (!this.authCodes || !this.authCodes.has(code)) {
+                const authData = this.authCodes.get(code);
+                if (!authData) {
                     console.error('[OAuth] Invalid or expired authorization code');
                     return res.status(400).json({
                         error: 'invalid_grant',
@@ -1514,31 +1642,52 @@ class YahooMailMCPServer {
                     });
                 }
 
-                const authData = this.authCodes.get(code);
-
-                // Validate PKCE code verifier
-                if (authData.code_challenge) {
-                    const crypto = await import('crypto');
-                    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
-                    if (hash !== authData.code_challenge) {
-                        console.error('[OAuth] PKCE validation failed');
-                        return res.status(400).json({
-                            error: 'invalid_grant',
-                            error_description: 'PKCE validation failed'
-                        });
-                    }
-                }
-
-                // Delete used auth code (one-time use)
+                // Codes are one-time use: burn it now so a replay cannot race a
+                // second exchange past the checks below.
                 this.authCodes.delete(code);
 
+                if (authData.expiresAt <= Date.now()) {
+                    console.error('[OAuth] Authorization code expired');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired authorization code'
+                    });
+                }
+
+                // The code is bound to the redirect_uri it was issued for (RFC 6749
+                // section 4.1.3)
+                if (redirect_uri !== authData.redirect_uri) {
+                    console.error('[OAuth] redirect_uri does not match the authorization request');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'redirect_uri does not match the authorization request'
+                    });
+                }
+
+                // Validate PKCE code verifier. The challenge is mandatory at
+                // /oauth/authorize, so a code without one should never exist.
+                if (!authData.code_challenge || typeof code_verifier !== 'string') {
+                    console.error('[OAuth] Missing PKCE code_verifier');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'code_verifier is required'
+                    });
+                }
+
+                const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+                if (!this.constantTimeEquals(hash, authData.code_challenge)) {
+                    console.error('[OAuth] PKCE validation failed');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'PKCE validation failed'
+                    });
+                }
+
                 // Generate access token
-                const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = this.issueAccessToken(reqClientId, authData.scope);
 
                 // Generate refresh token so the client can silently renew without re-authorizing
-                const refreshToken = Buffer.from(`refresh:${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validRefreshTokens.set(refreshToken, { client_id: reqClientId, scope: authData.scope || 'mcp' });
+                const refreshToken = this.issueRefreshToken(reqClientId, authData.scope);
 
                 console.error('[OAuth] Access token generated from authorization code');
 
@@ -1557,7 +1706,8 @@ class YahooMailMCPServer {
 
                 console.error('[OAuth] Refresh token grant - validating token');
 
-                if (!refresh_token || !this.validRefreshTokens.has(refresh_token)) {
+                const refreshData = refresh_token ? this.validRefreshTokens.get(refresh_token) : null;
+                if (!refreshData) {
                     console.error('[OAuth] Invalid or expired refresh token');
                     return res.status(400).json({
                         error: 'invalid_grant',
@@ -1565,16 +1715,19 @@ class YahooMailMCPServer {
                     });
                 }
 
-                const refreshData = this.validRefreshTokens.get(refresh_token);
-
                 // Rotate refresh token (one-time use) and issue a new access token
                 this.validRefreshTokens.delete(refresh_token);
 
-                const accessToken = Buffer.from(`${refreshData.client_id}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                if (refreshData.expiresAt <= Date.now()) {
+                    console.error('[OAuth] Refresh token expired');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired refresh token'
+                    });
+                }
 
-                const newRefreshToken = Buffer.from(`refresh:${refreshData.client_id}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validRefreshTokens.set(newRefreshToken, refreshData);
+                const accessToken = this.issueAccessToken(refreshData.client_id, refreshData.scope);
+                const newRefreshToken = this.issueRefreshToken(refreshData.client_id, refreshData.scope);
 
                 console.error('[OAuth] Access token renewed via refresh token');
 
@@ -1590,8 +1743,7 @@ class YahooMailMCPServer {
             // Handle Client Credentials Grant
             if (grantType === 'client_credentials') {
                 // Generate access token
-                const accessToken = Buffer.from(`${clientId}:${Date.now()}:${Math.random()}`).toString('base64');
-                this.validTokens.add(accessToken);
+                const accessToken = this.issueAccessToken(clientId, 'mcp');
 
                 console.error('[OAuth] Access token generated via client credentials');
 
@@ -1731,6 +1883,10 @@ class YahooMailMCPServer {
                 ]
             });
         });
+
+        // Expired entries are also rejected on use; this just stops the maps from
+        // growing without bound. unref() so it never keeps the process alive.
+        setInterval(() => this.pruneExpiredOAuthState(), EXPIRY_SWEEP_INTERVAL_MS).unref();
 
         app.listen(port, () => {
             console.error(`Yahoo Mail MCP server running on port ${port}`);

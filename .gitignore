@@ -56,3 +56,6 @@ build/
 # Temporary files
 tmp/
 temp/
+# Transient files written by the test harnesses
+.oauth.testable.mjs
+.server.testable.mjs

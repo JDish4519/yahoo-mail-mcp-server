@@ -56,3 +56,6 @@ build/
 # Temporary files
 tmp/
 temp/
+# Transient files written by the test harnesses
+.content.testable.mjs
+.demo.mjs

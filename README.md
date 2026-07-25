@@ -33,7 +33,7 @@ A Model Context Protocol (MCP) server that provides full email management for Ya
 
 ### For Local Development
 
-- **Node.js**: Version 18.0.0 or higher
+- **Node.js**: Version 22.0.0 or higher (the Docker image ships Node 24 LTS)
 - **Yahoo Mail Account**: With app-specific password enabled
 - **Git**: For version control
 
@@ -614,8 +614,9 @@ When running in SSE mode, the server exposes these endpoints:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/` | GET | API information and available tools |
-| `/health` | GET | Health check (returns status, version, timestamp) |
+| `/` | GET | Server name only (deliberately minimal, see Security) |
+| `/health` | GET | Liveness check, returns `{"status":"ok"}` |
+| `/diagnostics` | GET | Runtime and configuration detail (**requires OAuth token**) |
 | `/mcp/sse` | GET | Server-Sent Events endpoint for MCP (requires OAuth token) |
 | `/mcp/message` | POST | Message endpoint for MCP communication (requires OAuth token) |
 | `/.well-known/oauth-authorization-server` | GET | OAuth 2.0 server metadata (RFC 8414) |
@@ -625,14 +626,95 @@ When running in SSE mode, the server exposes these endpoints:
 
 ### Example Health Check Response
 
+`/health` is unauthenticated, so it reports only liveness:
+
+```json
+{ "status": "ok" }
+```
+
+Runtime detail moved to `/diagnostics`, which requires a Bearer token:
+
+```bash
+curl -H "Authorization: Bearer $ACCESS_TOKEN" https://your-app.onrender.com/diagnostics
+```
+
 ```json
 {
   "status": "ok",
   "service": "yahoo-mail-mcp",
-  "version": "1.0.0",
-  "timestamp": "2025-01-11T12:34:56.789Z"
+  "version": "3.0.0",
+  "timestamp": "2026-07-25T12:34:56.789Z",
+  "environment": {
+    "nodeVersion": "v24.18.0",
+    "platform": "linux",
+    "emailConfigured": true,
+    "passwordConfigured": true,
+    "transportMode": "sse"
+  }
 }
 ```
+
+## Security
+
+The server is hardened against a specific set of attacks. Each item has
+regression tests; if you change this code, run them.
+
+### Input reaching IMAP
+
+`search_emails` rejects control characters in `query` and `sender`, and caps
+them at 256 characters. The underlying `node-imap` escapes only backslashes and
+double quotes and treats every byte `<= 0x7F` as safe, so a bare CR or LF would
+otherwise survive into the quoted string and split the SEARCH into two IMAP
+command lines -- letting the second run as an arbitrary command such as
+`EXPUNGE`. Folder names are not affected: they pass through
+`escape(utf7.encode())`, which encodes anything outside `\x20-\x7e`.
+
+### OAuth
+
+- Access tokens, refresh tokens and authorization codes all carry an expiry that
+  is enforced on use and swept periodically. The advertised `expires_in` is real.
+- `redirect_uri` is parsed and matched on hostname against an allowlist, never by
+  substring. HTTPS is required except for a `localhost` dev callback.
+- PKCE with `S256` is **mandatory**. A request without `code_challenge` is
+  rejected, and the code is bound to its `redirect_uri` per RFC 6749 section
+  4.1.3.
+- Codes and tokens come from `crypto.randomBytes`; client credentials are
+  compared with `crypto.timingSafeEqual`.
+
+### Untrusted email content
+
+`read_email` fences everything the sender controls -- body **and** headers, since
+`From`, `Subject` and `Date` are equally attacker-authored -- inside markers
+carrying a random per-email nonce, with an explicit note that the contents are
+data and never authorization to call a tool. Marker-shaped text is stripped from
+the message so a sender cannot close the block early.
+
+This mitigates prompt injection, it does not eliminate it. Keep destructive tools
+behind an approval prompt in your MCP client.
+
+### Blast radius
+
+`delete_emails`, `archive_emails` and `move_emails` are capped at 50 UIDs per
+call. Reversible operations (`mark_as_read`, `flag_emails`, and their inverses)
+are uncapped.
+
+### Information disclosure
+
+`/health` and `/` are unauthenticated and deliberately minimal. They do not
+report the runtime version, platform, whether credentials are configured, or the
+tool inventory -- all of which help an attacker choose an exploit or confirm a
+live target. `x-powered-by` is disabled and error responses do not echo exception
+text. Use `/diagnostics` with a Bearer token for the real detail.
+
+### Running the tests
+
+```bash
+npm test
+```
+
+Runs all four suites: IMAP injection, OAuth, untrusted content and batch limits,
+and information disclosure. They boot the real server in-process and assert on
+live behaviour rather than on source text. No Yahoo credentials required.
 
 ## Breaking Changes & Migration Guide
 
@@ -778,7 +860,7 @@ read_email({ uids: [510867], folder: "Sent" })
 Advanced search with filters for date ranges, sender, and unread status.
 
 **Parameters:**
-- `query` (optional): Search term for subject or sender (can be empty for date-only searches)
+- `query` (optional): Search term for subject or sender (can be empty for date-only searches). Max 256 characters; control characters are rejected (see Security).
 - `count` (optional): Number of results to return (default: 10, max: 50)
 - `dateFrom` (optional): Filter emails from this date onwards (ISO 8601 or RFC 2822 format)
 - `dateTo` (optional): Filter emails up to this date (ISO 8601 or RFC 2822 format)
@@ -840,7 +922,7 @@ list_folders()
 Move emails to Trash folder using UIDs (soft delete - emails can be recovered).
 
 **Parameters:**
-- `uids` (required): Array of UIDs to delete (get UIDs from `list_emails` or `search_emails`)
+- `uids` (required): Array of UIDs to delete (get UIDs from `list_emails` or `search_emails`). **Maximum 50 per call.**
 - `folder` (optional): Source folder (default: 'INBOX')
 
 **Response:** Success/failure message with accurate count of processed emails
@@ -862,7 +944,7 @@ delete_emails({ uids: [510867], folder: "Sent" })
 Move emails to Archive folder using UIDs for long-term storage.
 
 **Parameters:**
-- `uids` (required): Array of UIDs to archive
+- `uids` (required): Array of UIDs to archive. **Maximum 50 per call.**
 - `folder` (optional): Source folder (default: 'INBOX')
 
 **Response:** Success/failure message with accurate count of processed emails
@@ -957,7 +1039,7 @@ unflag_emails({ uids: [510867, 510866, 510862] })
 Move emails to a specified folder using UIDs.
 
 **Parameters:**
-- `uids` (required): Array of UIDs to move
+- `uids` (required): Array of UIDs to move. **Maximum 50 per call.**
 - `folderName` (required): Name of the destination folder (e.g., "Work", "Personal", "Archive")
 - `sourceFolder` (optional): Source folder (default: 'INBOX')
 

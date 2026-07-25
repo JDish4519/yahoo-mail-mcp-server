@@ -43,6 +43,10 @@ class YahooMailMCPServer {
         // In production, use Redis with short TTL (60 seconds)
         this.authCodes = new Map();
 
+        // Store valid OAuth refresh tokens (in-memory)
+        // Maps refresh_token -> { client_id, scope }. In production, use Redis or a database.
+        this.validRefreshTokens = new Map();
+
         this.setupToolHandlers();
         this.setupErrorHandling();
     }
@@ -1353,7 +1357,7 @@ class YahooMailMCPServer {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
                 token_endpoint: `${baseUrl}/oauth/token`,
-                grant_types_supported: ['authorization_code', 'client_credentials'],
+                grant_types_supported: ['authorization_code', 'client_credentials', 'refresh_token'],
                 response_types_supported: ['code'],
                 token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
                 code_challenge_methods_supported: ['S256'],
@@ -1532,13 +1536,54 @@ class YahooMailMCPServer {
                 const accessToken = Buffer.from(`${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
                 this.validTokens.add(accessToken);
 
+                // Generate refresh token so the client can silently renew without re-authorizing
+                const refreshToken = Buffer.from(`refresh:${reqClientId}:${Date.now()}:${Math.random()}`).toString('base64');
+                this.validRefreshTokens.set(refreshToken, { client_id: reqClientId, scope: authData.scope || 'mcp' });
+
                 console.error('[OAuth] Access token generated from authorization code');
 
                 return res.json({
                     access_token: accessToken,
                     token_type: 'Bearer',
                     expires_in: 3600,
+                    refresh_token: refreshToken,
                     scope: authData.scope || 'mcp'
+                });
+            }
+
+            // Handle Refresh Token Grant
+            if (grantType === 'refresh_token') {
+                const { refresh_token } = req.body;
+
+                console.error('[OAuth] Refresh token grant - validating token');
+
+                if (!refresh_token || !this.validRefreshTokens.has(refresh_token)) {
+                    console.error('[OAuth] Invalid or expired refresh token');
+                    return res.status(400).json({
+                        error: 'invalid_grant',
+                        error_description: 'Invalid or expired refresh token'
+                    });
+                }
+
+                const refreshData = this.validRefreshTokens.get(refresh_token);
+
+                // Rotate refresh token (one-time use) and issue a new access token
+                this.validRefreshTokens.delete(refresh_token);
+
+                const accessToken = Buffer.from(`${refreshData.client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+                this.validTokens.add(accessToken);
+
+                const newRefreshToken = Buffer.from(`refresh:${refreshData.client_id}:${Date.now()}:${Math.random()}`).toString('base64');
+                this.validRefreshTokens.set(newRefreshToken, refreshData);
+
+                console.error('[OAuth] Access token renewed via refresh token');
+
+                return res.json({
+                    access_token: accessToken,
+                    token_type: 'Bearer',
+                    expires_in: 3600,
+                    refresh_token: newRefreshToken,
+                    scope: refreshData.scope || 'mcp'
                 });
             }
 
@@ -1562,7 +1607,7 @@ class YahooMailMCPServer {
             console.error('[OAuth] Unsupported grant type:', grantType);
             res.status(400).json({
                 error: 'unsupported_grant_type',
-                error_description: 'Supported grant types: authorization_code, client_credentials'
+                error_description: 'Supported grant types: authorization_code, client_credentials, refresh_token'
             });
         });
 

@@ -16,7 +16,7 @@
     "docker:compose:logs": "docker-compose logs -f",
     "test:health": "node -e \"require('http').get('http://localhost:3000/health', r => { let d=''; r.on('data', c => d+=c); r.on('end', () => console.log(d)); })\"",
     "test:sse": "node -e \"require('http').get('http://localhost:3000/mcp/sse', r => console.log('SSE Status:', r.statusCode))\"",
-    "test": "node injection.test.mjs && node oauth.test.mjs && node content-safety.test.mjs && node disclosure.test.mjs"
+    "test": "node injection.test.mjs && node oauth.test.mjs && node content-safety.test.mjs && node disclosure.test.mjs && node access-control.test.mjs"
   },
   "keywords": [
     "mcp",

@@ -29,6 +29,12 @@ const EXPIRY_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
 // Hosts allowed as OAuth redirect targets. Matched against the parsed hostname,
 // never with substring tests -- "evil.com/?x=claude.ai" must not pass.
 const ALLOWED_REDIRECT_HOSTS = ['claude.ai', 'claude.com'];
+
+// Browser origins permitted to call this server cross-origin. Exact matches
+// only: unlike a redirect_uri there is no reason to accept arbitrary subdomains
+// here, and a single subdomain takeover would otherwise reach the mailbox.
+// Extend for local tooling with MCP_ALLOWED_ORIGINS (comma-separated).
+const ALLOWED_ORIGINS = ['https://claude.ai', 'https://claude.com'];
 // Ceiling on how many emails one destructive call may touch. Bounds the blast
 // radius if a request is ever malformed or manipulated; large cleanups still
 // work, they just paginate.
@@ -1411,6 +1417,49 @@ class YahooMailMCPServer {
     }
 
     /**
+     * Helper: Browser origins allowed to make cross-origin requests
+     *
+     * Reflecting the caller's own Origin (the old `origin: true`) combined with
+     * credentials: true is an explicit opt-in to being driven by any website the
+     * user happens to visit.
+     */
+    allowedOrigins() {
+        const extra = (process.env.MCP_ALLOWED_ORIGINS || '')
+            .split(',')
+            .map((o) => o.trim())
+            .filter(Boolean);
+
+        return [...ALLOWED_ORIGINS, ...extra];
+    }
+
+    /**
+     * Helper: Host header values this server will answer MCP requests on
+     *
+     * Any other Host means the request arrived via a name the operator did not
+     * configure -- the shape of a DNS rebinding attack, where an attacker points
+     * their own hostname at this server so their page counts as same-origin.
+     */
+    allowedHosts(port) {
+        const configured = (process.env.MCP_ALLOWED_HOSTS || '')
+            .split(',')
+            .map((h) => h.trim())
+            .filter(Boolean);
+
+        if (configured.length > 0) {
+            return configured;
+        }
+
+        // Render injects the public hostname, so a default deployment still works
+        // without the operator having to set anything.
+        const renderHost = process.env.RENDER_EXTERNAL_HOSTNAME;
+        if (renderHost) {
+            return [renderHost, `${renderHost}:443`];
+        }
+
+        return [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`];
+    }
+
+    /**
      * Helper: Mint an access token that actually stops working when it expires
      */
     issueAccessToken(clientId, scope) {
@@ -1483,6 +1532,20 @@ class YahooMailMCPServer {
         const app = express();
         const port = process.env.PORT || 3000;
 
+        // Fail closed. Authentication used to wave every request through when
+        // OAuth was unconfigured, which turned a forgotten environment variable
+        // into an anonymous, internet-facing mailbox with delete rights. Exiting
+        // non-zero also makes the deploy fail visibly instead of coming up open.
+        if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+            console.error('[Server] FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required in SSE mode.');
+            console.error('[Server] Generate them with:  openssl rand -hex 16  /  openssl rand -hex 32');
+            console.error('[Server] Refusing to start a server that can read and delete mail without authentication.');
+            process.exit(1);
+        }
+
+        const allowedOrigins = this.allowedOrigins();
+        const allowedHosts = this.allowedHosts(port);
+
         // Don't advertise the framework in every response header
         app.disable('x-powered-by');
 
@@ -1493,16 +1556,56 @@ class YahooMailMCPServer {
         console.error('[Server] Environment:', process.env.NODE_ENV || 'development');
         console.error('[Server] Email configured:', !!process.env.YAHOO_EMAIL);
         console.error('[Server] Password configured:', !!process.env.YAHOO_APP_PASSWORD);
+        console.error('[Server] Allowed origins:', allowedOrigins.join(', '));
+        console.error('[Server] Allowed hosts:', allowedHosts.join(', '));
 
-        // Enable CORS for Claude.ai and remote MCP connections
+        // CORS, restricted to Claude's origins. A request with no Origin header is
+        // not from a browser (curl, the MCP client itself), and CORS is a browser
+        // control, so it is allowed through to the Bearer token check instead.
         app.use(cors({
-            origin: true,  // Allow all origins (Render's proxy may modify origin headers)
+            origin: (origin, callback) => {
+                if (!origin) {
+                    return callback(null, true);
+                }
+                if (allowedOrigins.includes(origin)) {
+                    return callback(null, true);
+                }
+                console.error('[Security] Refused CORS for origin:', origin);
+                // No Access-Control-Allow-Origin header -> the browser blocks it.
+                return callback(null, false);
+            },
             credentials: true,
             methods: ['GET', 'POST', 'OPTIONS'],
             allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
             exposedHeaders: ['Content-Type'],
             maxAge: 86400  // Cache preflight for 24 hours
         }));
+
+        // Reject DNS rebinding on the MCP endpoints. SSEServerTransport can check
+        // Host itself, but only on POSTs -- it never sees the GET that opens the
+        // stream -- so the check has to live here too. Scoped to /mcp so health
+        // checks and OAuth discovery keep working from any hostname.
+        app.use('/mcp', (req, res, next) => {
+            const host = req.headers.host;
+            if (!host || !allowedHosts.includes(host)) {
+                console.error('[Security] Rejected MCP request with disallowed Host:', host);
+                return res.status(403).json({
+                    error: 'forbidden',
+                    error_description: 'Host header is not allowed'
+                });
+            }
+
+            const origin = req.headers.origin;
+            if (origin && !allowedOrigins.includes(origin)) {
+                console.error('[Security] Rejected MCP request with disallowed Origin:', origin);
+                return res.status(403).json({
+                    error: 'forbidden',
+                    error_description: 'Origin is not allowed'
+                });
+            }
+
+            next();
+        });
 
         // Parse request bodies for different content types
         // Skip /mcp/message which needs raw body for SSE
@@ -1541,13 +1644,15 @@ class YahooMailMCPServer {
                 return next();
             }
 
-            // Check if OAuth is configured
-            const oauthConfigured = process.env.OAUTH_CLIENT_ID && process.env.OAUTH_CLIENT_SECRET;
-
-            if (!oauthConfigured) {
-                console.error('[Auth] WARNING: OAuth not configured - server is UNSECURED!');
-                console.error('[Auth] Set OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET to secure your server');
-                return next();
+            // Startup already refuses to run without these, so reaching this branch
+            // means the configuration changed underneath us. Deny rather than fall
+            // back to letting everyone in.
+            if (!process.env.OAUTH_CLIENT_ID || !process.env.OAUTH_CLIENT_SECRET) {
+                console.error('[Auth] OAuth credentials missing at request time - denying');
+                return res.status(503).json({
+                    error: 'server_error',
+                    error_description: 'Server is not configured for authentication'
+                });
             }
 
             // Validate OAuth Bearer token
@@ -1932,7 +2037,13 @@ class YahooMailMCPServer {
                 console.error('[SSE] Origin:', req.headers.origin);
                 console.error('[SSE] User-Agent:', req.headers['user-agent']);
 
-                const transport = new SSEServerTransport('/mcp/message', res);
+                // Defence in depth: the transport re-checks Host and Origin on every
+                // POST it handles, independently of the middleware above.
+                const transport = new SSEServerTransport('/mcp/message', res, {
+                    enableDnsRebindingProtection: true,
+                    allowedHosts,
+                    allowedOrigins
+                });
 
                 // Get session ID from transport
                 const sessionId = transport.sessionId;

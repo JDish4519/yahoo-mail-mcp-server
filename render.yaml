@@ -29,6 +29,21 @@ services:
       - key: YAHOO_APP_PASSWORD
         sync: false  # Set this in Render Dashboard (Settings > Environment)
 
+      # REQUIRED. The server refuses to start in SSE mode without these, because
+      # without them anyone who finds the URL can read and delete the mailbox.
+      #   Client ID:     openssl rand -hex 16
+      #   Client Secret: openssl rand -hex 32
+      - key: OAUTH_CLIENT_ID
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+      - key: OAUTH_CLIENT_SECRET
+        sync: false  # Set this in Render Dashboard (Settings > Environment)
+
+      # Optional. MCP requests are rejected unless the Host header matches, which
+      # blocks DNS rebinding. Defaults to RENDER_EXTERNAL_HOSTNAME, which Render
+      # injects automatically, so this only needs setting behind a custom domain.
+      # - key: MCP_ALLOWED_HOSTS
+      #   value: mail.example.com
+
     # Health check configuration
     healthCheckPath: /health
 

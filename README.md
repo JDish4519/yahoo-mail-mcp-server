@@ -477,11 +477,15 @@ docker ps
 | `YAHOO_APP_PASSWORD` | Yes | - | 16-character app-specific password from Yahoo |
 | `OAUTH_CLIENT_ID` | Yes (Remote) | - | OAuth 2.0 client ID for MCP server authentication (generate with `openssl rand -hex 16`) |
 | `OAUTH_CLIENT_SECRET` | Yes (Remote) | - | OAuth 2.0 client secret for MCP server authentication (generate with `openssl rand -hex 32`) |
+| `MCP_ALLOWED_HOSTS` | No | Render hostname, else `localhost:PORT` | Comma-separated `Host` header values accepted on `/mcp/*`. Set this behind a custom domain |
+| `MCP_ALLOWED_ORIGINS` | No | - | Comma-separated extra browser origins allowed to call the server. `https://claude.ai` and `https://claude.com` are always allowed |
 | `TRANSPORT_MODE` | No | `stdio` | Transport mode: `stdio` or `sse` |
 | `PORT` | No | `3000` | Port for SSE mode (auto-set by Render) |
 | `NODE_ENV` | No | `development` | Environment: `development` or `production` |
 
 **Note**: `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET` are only required for remote deployments (Render.com). Local stdio mode doesn't require OAuth.
+
+**The server exits with status 1 if either is missing while `TRANSPORT_MODE=sse`.** It will not fall back to running unauthenticated: an SSE deployment without OAuth is an anonymous, internet-facing mailbox that anyone who finds the URL can read and delete from. If a Render deploy fails at boot with `FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required`, set both in Settings > Environment.
 
 ## Available npm Scripts
 
@@ -524,27 +528,34 @@ yahoo-mail-mcp-server/
    - Only clients with correct credentials can access your emails
    - Generate strong random credentials: `openssl rand -hex 16` and `openssl rand -hex 32`
    - Store credentials securely in Render dashboard (marked as "Secret")
+   - **Fails closed**: SSE mode refuses to start without both credentials rather than serving requests unauthenticated
 
-2. **Never commit credentials**
+2. **Browser origin and host restrictions**
+   - CORS is limited to `https://claude.ai` and `https://claude.com`; the server does not reflect arbitrary origins
+   - Requests with no `Origin` header (non-browser clients such as the MCP client itself) are still served, then checked for a Bearer token
+   - `/mcp/*` rejects any request whose `Host` header is not in the allowed list, which blocks DNS rebinding — where a malicious page resolves its own hostname to this server so its scripts count as same-origin
+   - Configure with `MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS` when using a custom domain
+
+3. **Never commit credentials**
    - `.env` file is gitignored
    - Always use `.env.example` as template
    - Set sensitive values in Render dashboard
    - Never share OAuth credentials publicly
 
-3. **Use app-specific passwords**
+4. **Use app-specific passwords**
    - Never use your main Yahoo password
    - Generate new passwords for each service
    - Revoke unused passwords regularly
    - App passwords can be revoked without changing your main password
 
-4. **Email management operations**
+5. **Email management operations**
    - All modification operations are reversible (soft delete, not permanent)
    - Deleted emails are moved to Trash folder (recoverable within 7 days for free accounts)
    - Archive, flag, and read status changes are non-destructive
    - Move operations preserve email content and metadata
    - No send operations - server cannot send emails on your behalf
 
-5. **HTTPS in production**
+6. **HTTPS in production**
    - Render.com provides free SSL certificates
    - All traffic is encrypted (TLS/SSL)
    - IMAP connection uses TLS

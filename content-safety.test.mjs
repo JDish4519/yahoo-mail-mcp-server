@@ -182,6 +182,84 @@ console.log('\n--- list/search output is fenced too ---');
     }
 }
 
+console.log('\n--- read_email waits for parsing before resolving ---');
+{
+    // simpleParser is async. The fetch 'end' event used to resolve the call
+    // without waiting for it, so the body was dropped and the call still
+    // reported success. The worst case is the smallest gap, so these emit
+    // fetch 'end' in the same tick as the last message.
+    const { EventEmitter } = await import('events');
+
+    const rawEmail = (subject, body) => [
+        'From: Alice <alice@example.com>',
+        'To: bob@yahoo.com',
+        `Subject: ${subject}`,
+        'Date: Mon, 1 Jan 2024 00:00:00 +0000',
+        'Content-Type: text/plain; charset=utf-8',
+        '',
+        body,
+        ''
+    ].join('\r\n');
+
+    const fakeImapFor = (messages, endDelay = 0) => ({
+        openBox: (name, readOnly, cb) => setImmediate(() => cb(null, {})),
+        fetch: () => {
+            const f = new EventEmitter();
+            setImmediate(() => {
+                for (const m of messages) {
+                    const msg = new EventEmitter();
+                    f.emit('message', msg, m.seq);
+                    const stream = new EventEmitter();
+                    msg.emit('body', stream, {});
+                    stream.emit('data', Buffer.from(m.raw, 'ascii'));
+                    msg.emit('attributes', { uid: m.uid, size: m.raw.length, flags: [], struct: [] });
+                    msg.emit('end');
+                }
+                if (endDelay === 0) f.emit('end');
+                else setTimeout(() => f.emit('end'), endDelay);
+            });
+            return f;
+        },
+        end: () => {}
+    });
+
+    const textOf = r => r?.content?.[0]?.text ?? '';
+
+    // Single email, worst-case timing.
+    srv.createImapConnection = async () => fakeImapFor([
+        { uid: 42, seq: 1, raw: rawEmail('Q3 numbers', 'The revenue figure is 412,000.') }
+    ]);
+    const one = textOf(await srv.readEmail([42], 'INBOX'));
+    check('single read returns body at 0ms gap', one.includes('412,000'), `got ${one.length} chars`);
+    check('single read includes the subject', one.includes('Q3 numbers'), one.slice(0, 60));
+    check('single read is not empty', one.trim() !== '');
+
+    // Every message in a batch must survive, not just the early ones.
+    srv.createImapConnection = async () => fakeImapFor([
+        { uid: 10, seq: 1, raw: rawEmail('First', 'body-one-marker') },
+        { uid: 11, seq: 2, raw: rawEmail('Second', 'body-two-marker') },
+        { uid: 12, seq: 3, raw: rawEmail('Third', 'body-three-marker') }
+    ]);
+    const many = textOf(await srv.readEmail([10, 11, 12], 'INBOX'));
+    for (const marker of ['body-one-marker', 'body-two-marker', 'body-three-marker']) {
+        check(`batch read includes ${marker}`, many.includes(marker), `missing from ${many.length} chars`);
+    }
+    check('batch read fences each email separately',
+        (many.match(/<<<UNTRUSTED_EMAIL_/g) || []).length === 3,
+        `${(many.match(/<<<UNTRUSTED_EMAIL_/g) || []).length} fences`);
+
+    // Awaiting must not have broken the missing-UID guard.
+    srv.createImapConnection = async () => fakeImapFor([
+        { uid: 10, seq: 1, raw: rawEmail('Only one', 'body-one-marker') }
+    ]);
+    const missing = await srv.readEmail([10, 99], 'INBOX').then(
+        r => ({ ok: true, text: textOf(r) }),
+        e => ({ ok: false, text: e.message })
+    );
+    check('missing UID still rejects',
+        !missing.ok && missing.text.includes('99'), missing.text.slice(0, 70));
+}
+
 console.log('\n--- destructive batch cap ---');
 {
     let opened = false;

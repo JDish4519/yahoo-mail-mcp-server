@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The suite only reads the checkout and binds localhost ports. It never needs
+# to write to the repository, so the token stays read-only.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22 is the floor declared in package.json engines; 24 is what the
+        # Docker image ships. Both have to stay green.
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - run: npm ci
+
+      # Covers IMAP command injection, OAuth, untrusted-content fencing and
+      # information disclosure. Every suite exits non-zero on failure.
+      - run: npm test
+
+      # Dev-only advisories are noise for a server that ships production deps
+      # alone, and moderates should not block a merge. High and critical should.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high

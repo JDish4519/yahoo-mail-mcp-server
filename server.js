@@ -1003,6 +1003,10 @@ class YahooMailMCPServer {
 
                 const emails = [];
                 const foundUIDs = new Set();
+                // One entry per message, settled when that message has been parsed.
+                // Nothing may resolve until all of these are done.
+                const parses = [];
+                const parseFailures = [];
 
                 fetch.on('message', (msg, seqno) => {
                     let buffer = '';
@@ -1020,25 +1024,30 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
-                            emails.push({
-                                uid: attrs.uid,
-                                sequenceNumber: seqno,  // Still include for reference
-                                from: parsed.from?.text || 'Unknown',
-                                to: parsed.to?.text || 'Unknown',
-                                subject: parsed.subject || 'No Subject',
-                                date: parsed.date || 'Unknown Date',
-                                size: attrs.size || 0,
-                                flags: attrs.flags || [],
-                                hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
-                            });
-                        });
+                        parses.push(
+                            simpleParser(buffer)
+                                .then((parsed) => {
+                                    emails.push({
+                                        uid: attrs.uid,
+                                        sequenceNumber: seqno,  // Still include for reference
+                                        from: parsed.from?.text || 'Unknown',
+                                        to: parsed.to?.text || 'Unknown',
+                                        subject: parsed.subject || 'No Subject',
+                                        date: parsed.date || 'Unknown Date',
+                                        size: attrs.size || 0,
+                                        flags: attrs.flags || [],
+                                        hasAttachments: this.hasAttachments(attrs.struct),
+                                        content: parsed.text || parsed.html || 'No content available'
+                                    });
+                                })
+                                .catch((err) => {
+                                    // Recorded rather than logged and dropped: an
+                                    // unparseable message used to vanish from the
+                                    // results while the call still reported success.
+                                    console.error(`[UID ${attrs?.uid}] Error parsing email:`, err.message);
+                                    parseFailures.push({ uid: attrs?.uid, message: err.message });
+                                })
+                        );
                     });
                 });
 
@@ -1047,8 +1056,16 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
                     imap.end();
+
+                    // simpleParser is asynchronous, so the parses started above are
+                    // very likely still running: the last message in a batch is
+                    // always racing this event. Resolving here without waiting
+                    // returned an empty or partial body and still reported success,
+                    // because the missing-UID check below reads foundUIDs, which is
+                    // populated synchronously and so never noticed.
+                    await Promise.all(parses);
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));
@@ -1057,6 +1074,16 @@ class YahooMailMCPServer {
                             `UIDs not found: ${missingUIDs.join(', ')}. ` +
                             `Found ${emails.length} of ${uids.length} requested emails. ` +
                             `Missing UIDs may have been deleted or moved to another folder.`
+                        ));
+                        return;
+                    }
+
+                    // A message that arrived but could not be parsed is unreadable,
+                    // not absent, so it needs saying rather than a silent short read.
+                    if (parseFailures.length > 0) {
+                        reject(new Error(
+                            `Failed to parse ${parseFailures.length} of ${uids.length} email(s): ` +
+                            parseFailures.map(f => `UID ${f.uid} (${f.message})`).join('; ')
                         ));
                         return;
                     }

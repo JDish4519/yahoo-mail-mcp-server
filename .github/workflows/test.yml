@@ -40,3 +40,84 @@ jobs:
       # alone, and moderates should not block a merge. High and critical should.
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Render deploys this image. Nothing built it until now, so a Dockerfile
+      # that no longer produced a working container would first be discovered by
+      # a failed deploy.
+      - name: Build image
+        run: docker build -t yahoo-mail-mcp:ci .
+
+      # The production stage must not carry the build toolchain. This is the
+      # assertion behind confining apk add to the builder stage.
+      - name: Assert the build toolchain is absent
+        run: |
+          if docker run --rm yahoo-mail-mcp:ci sh -c 'command -v g++ || command -v python3 || command -v make'; then
+            echo "::error::build toolchain leaked into the production image"
+            exit 1
+          fi
+          echo "toolchain absent from the runtime image"
+
+      # The fail-closed guard has to hold in the built image, not just in tests.
+      - name: Refuses to start without OAuth credentials
+        run: |
+          set +e
+          out=$(docker run --rm \
+            -e YAHOO_EMAIL=ci@example.com \
+            -e YAHOO_APP_PASSWORD=xxxxxxxxxxxxxxxx \
+            yahoo-mail-mcp:ci 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" != "1" ]; then
+            echo "::error::expected exit 1 without OAuth credentials, got $code"
+            exit 1
+          fi
+          echo "$out" | grep -q 'OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required' || {
+            echo "::error::exited without explaining why"; exit 1; }
+
+      - name: Start the container
+        run: |
+          docker run -d --name mcp -p 3000:3000 \
+            -e YAHOO_EMAIL=ci@example.com \
+            -e YAHOO_APP_PASSWORD=xxxxxxxxxxxxxxxx \
+            -e OAUTH_CLIENT_ID=ci-client-id \
+            -e OAUTH_CLIENT_SECRET=ci-client-secret \
+            yahoo-mail-mcp:ci
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3000/health >/dev/null 2>&1; then
+              echo "container is serving"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::container never became healthy"
+          docker logs mcp
+          exit 1
+
+      # Same two checks recommended after a deploy, run against the real image.
+      - name: Smoke test the running image
+        run: |
+          curl -sf http://localhost:3000/health | grep -q '"status":"ok"' || {
+            echo "::error::/health did not report ok"; exit 1; }
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/mcp/sse)
+          if [ "$code" != "401" ]; then
+            echo "::error::/mcp/sse should require auth, got $code"
+            docker logs mcp
+            exit 1
+          fi
+          echo "health ok; /mcp/sse requires a token"
+
+      - name: Container logs
+        if: always()
+        run: docker logs mcp 2>&1 || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f mcp 2>/dev/null || true

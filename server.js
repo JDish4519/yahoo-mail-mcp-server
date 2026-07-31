@@ -58,6 +58,12 @@ const MAX_SEARCH_STRING_LENGTH = 256;
 // manipulated argument rather than a real folder.
 const MAX_FOLDER_NAME_LENGTH = 256;
 
+// Token endpoint throttling. Generous enough that a client renewing an access
+// token, retrying a failure, and reconnecting never notices.
+const TOKEN_RATE_WINDOW_MS = 60 * 1000;
+const TOKEN_RATE_MAX_ATTEMPTS = 20;
+const TOKEN_RATE_MAX_CLIENTS = 1000;
+
 const MAX_READ_BATCH = 20;
 const MAX_TOTAL_READ_BYTES = 25 * 1024 * 1024;  // 25 MB across the whole call
 
@@ -921,31 +927,6 @@ class YahooMailMCPServer {
                 }
             });
         });
-    }
-
-    /**
-     * Validate sequence numbers array for all email operations
-     * @returns {string|null} Error message if invalid, null if valid
-     */
-    validateSequenceNumbers(sequenceNumbers) {
-        if (!sequenceNumbers) {
-            return 'sequenceNumbers is required';
-        }
-
-        if (!Array.isArray(sequenceNumbers)) {
-            return 'sequenceNumbers must be an array';
-        }
-
-        if (sequenceNumbers.length === 0) {
-            return 'sequenceNumbers cannot be empty';
-        }
-
-        const invalidValues = sequenceNumbers.filter(n => n === undefined || n === null || typeof n !== 'number');
-        if (invalidValues.length > 0) {
-            return 'sequenceNumbers contains invalid values (must be numbers)';
-        }
-
-        return null;
     }
 
     /**
@@ -1822,6 +1803,12 @@ class YahooMailMCPServer {
         // Don't advertise the framework in every response header
         app.disable('x-powered-by');
 
+        // Trust exactly one proxy hop. Render terminates TLS and sets
+        // X-Forwarded-For; without this req.ip is the proxy's address and every
+        // client shares one rate-limit bucket. Trusting one hop rather than all
+        // means a caller cannot pick their own bucket by prepending addresses.
+        app.set('trust proxy', 1);
+
         // Log startup configuration
         console.error('[Server] Starting in SSE mode');
         console.error('[Server] Port:', port);
@@ -1968,9 +1955,23 @@ class YahooMailMCPServer {
         // Apply authentication to all MCP endpoints
         app.use(authenticateMCP);
 
+        // Where this server tells clients to find its OAuth endpoints. Derived
+        // from the Host header only as a fallback: Host is set by the caller, so a
+        // request carrying a forged one would otherwise produce a discovery
+        // document pointing at an attacker's authorization and token endpoints.
+        // Set PUBLIC_URL in production to pin it.
+        const publicBaseUrl = (req) => {
+            const configured = process.env.PUBLIC_URL || (
+                process.env.RENDER_EXTERNAL_HOSTNAME
+                    ? `https://${process.env.RENDER_EXTERNAL_HOSTNAME}`
+                    : null
+            );
+            return (configured || `https://${req.get('host')}`).replace(/\/+$/, '');
+        };
+
         // Helper function to generate OAuth metadata
         const getOAuthMetadata = (req) => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = publicBaseUrl(req);
             return {
                 issuer: baseUrl,
                 authorization_endpoint: `${baseUrl}/oauth/authorize`,
@@ -1985,7 +1986,7 @@ class YahooMailMCPServer {
 
         // Helper function to generate protected resource metadata
         const getProtectedResourceMetadata = (req, resourcePath = '') => {
-            const baseUrl = `https://${req.get('host')}`;
+            const baseUrl = publicBaseUrl(req);
             return {
                 resource: resourcePath ? `${baseUrl}${resourcePath}` : baseUrl,
                 authorization_servers: [baseUrl],
@@ -2090,8 +2091,39 @@ class YahooMailMCPServer {
             res.redirect(redirectUrl.toString());
         });
 
+        // Throttle credential guessing. A 32-byte secret is not brute-forceable,
+        // but nothing guaranteed the operator generated one that long, and an
+        // unthrottled endpoint rewards trying. Per-IP sliding window, in memory.
+        const tokenAttempts = new Map();
+        const rateLimitToken = (req, res, next) => {
+            const now = Date.now();
+            const key = req.ip || 'unknown';
+            const recent = (tokenAttempts.get(key) || []).filter((t) => now - t < TOKEN_RATE_WINDOW_MS);
+
+            if (recent.length >= TOKEN_RATE_MAX_ATTEMPTS) {
+                console.error('[OAuth] Rate limit exceeded for', key);
+                res.set('Retry-After', String(Math.ceil(TOKEN_RATE_WINDOW_MS / 1000)));
+                return res.status(429).json({
+                    error: 'too_many_requests',
+                    error_description: 'Too many token requests. Try again later.'
+                });
+            }
+
+            recent.push(now);
+            tokenAttempts.set(key, recent);
+
+            // Bound the map: without this, distinct source IPs accumulate forever.
+            if (tokenAttempts.size > TOKEN_RATE_MAX_CLIENTS) {
+                for (const [k, times] of tokenAttempts) {
+                    if (times.every((t) => now - t >= TOKEN_RATE_WINDOW_MS)) tokenAttempts.delete(k);
+                }
+            }
+
+            next();
+        };
+
         // OAuth Token Endpoint (supports both Authorization Code and Client Credentials flows)
-        app.post('/oauth/token', async (req, res) => {
+        app.post('/oauth/token', rateLimitToken, async (req, res) => {
             console.error('[OAuth] Token request - grant type:', req.body?.grant_type || 'unknown');
 
             const clientId = process.env.OAUTH_CLIENT_ID;

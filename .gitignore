@@ -64,3 +64,4 @@ temp/
 .disclosure.testable.mjs
 .access.testable.mjs
 .limits.testable.mjs
+.folder.testable.mjs

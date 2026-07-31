@@ -82,20 +82,12 @@ const UNTRUSTED_LISTING_NOTE =
 
 class YahooMailMCPServer {
     constructor() {
-        this.server = new Server(
-            {
-                name: 'yahoo-mail-mcp',
-                version: '3.0.0',
-            },
-            {
-                capabilities: {
-                    tools: {},
-                },
-            }
-        );
+        this.server = this.createServer();
 
-        // Store active SSE transports (for routing messages)
-        this.transports = new Map();
+        // Store active SSE sessions: sessionId -> { transport, server }.
+        // Each session owns its own Server, because a Protocol instance refuses a
+        // second connect() and a transport must not be shared between clients.
+        this.sessions = new Map();
 
         // Store valid OAuth access tokens (in-memory)
         // Maps access_token -> { client_id, scope, expiresAt }
@@ -110,16 +102,40 @@ class YahooMailMCPServer {
         // Maps refresh_token -> { client_id, scope, expiresAt }. In production, use Redis or a database.
         this.validRefreshTokens = new Map();
 
-        this.setupToolHandlers();
         this.setupErrorHandling();
+    }
+
+    /**
+     * Build a fully configured MCP Server
+     *
+     * One per connection. The SDK's Protocol takes ownership of a transport and
+     * throws on a second connect(), so a single shared instance could serve only
+     * one SSE client -- every later connection errored out while leaving a dead
+     * entry behind in the session map.
+     */
+    createServer() {
+        const server = new Server(
+            {
+                name: 'yahoo-mail-mcp',
+                version: '3.0.0',
+            },
+            {
+                capabilities: {
+                    tools: {},
+                },
+            }
+        );
+
+        this.setupToolHandlers(server);
+        return server;
     }
 
     /**
      * Setup MCP tool handlers
      */
-    setupToolHandlers() {
+    setupToolHandlers(server = this.server) {
         // Handle tool listing
-        this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
             return {
                 tools: [
                     {
@@ -376,7 +392,7 @@ class YahooMailMCPServer {
         });
 
         // Handle tool execution
-        this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+        server.setRequestHandler(CallToolRequestSchema, async (request) => {
             const { name, arguments: args } = request.params;
 
             try {
@@ -2306,51 +2322,60 @@ class YahooMailMCPServer {
                 const sessionId = transport.sessionId;
                 console.error('[SSE] Session ID:', sessionId);
 
-                // Store the transport for message routing
-                this.transports.set(sessionId, transport);
-
-                // Clean up on disconnect
-                transport.onclose = () => {
-                    console.error('[SSE] Connection closed, cleaning up session:', sessionId);
-                    this.transports.delete(sessionId);
+                // A Server per connection. Sharing one made every connection after
+                // the first throw 'Already connected to a transport'.
+                const sessionServer = this.createServer();
+                sessionServer.onerror = (error) => {
+                    console.error(`[MCP Error] session ${sessionId}:`, error);
                 };
 
-                await this.server.connect(transport);
-                console.error('[SSE] MCP server connected to transport');
+                // Registered before connect() so a failure below cannot leave the
+                // session behind: onclose is wired inside start(), which throws
+                // first, and the old code added to the map regardless.
+                transport.onclose = () => {
+                    console.error('[SSE] Connection closed, cleaning up session:', sessionId);
+                    this.sessions.delete(sessionId);
+                };
+
+                await sessionServer.connect(transport);
+
+                // Only a session that actually connected is routable.
+                this.sessions.set(sessionId, { transport, server: sessionServer });
+                console.error('[SSE] MCP server connected;', this.sessions.size, 'active session(s)');
             } catch (error) {
                 console.error('[SSE] Error connecting transport:', error);
                 if (!res.headersSent) {
-                    res.status(500).json({ error: error.message });
+                    res.status(500).json({ error: 'Failed to establish SSE session' });
                 }
             }
         });
 
         // Message endpoint for SSE
         app.post('/mcp/message', async (req, res) => {
-            console.error('[SSE] Received message on /mcp/message');
-            console.error('[SSE] Active transports:', this.transports.size);
-
-            // Extract session ID from query or headers (body not parsed yet)
             const sessionId = req.query?.sessionId || req.headers['x-session-id'];
-            console.error('[SSE] Session ID from request:', sessionId);
 
-            if (sessionId && this.transports.has(sessionId)) {
-                const transport = this.transports.get(sessionId);
-                console.error('[SSE] Routing message to transport:', sessionId);
-                // Let the transport handle the message
-                transport.handlePostMessage(req, res);
-            } else {
-                // If no session ID or transport not found, try the first available transport
-                // (for backwards compatibility with single-connection scenario)
-                const firstTransport = Array.from(this.transports.values())[0];
-                if (firstTransport) {
-                    console.error('[SSE] No session ID, using first available transport');
-                    firstTransport.handlePostMessage(req, res);
-                } else {
-                    console.error('[SSE] No active transport found');
-                    res.status(404).json({ error: 'No active SSE connection found' });
-                }
+            // No guessing. This used to fall back to "the first available
+            // transport" when the session was missing or unknown, which let one
+            // caller inject JSON-RPC requests into somebody else's stream and have
+            // the results delivered to that other client.
+            if (!sessionId) {
+                console.error('[SSE] Rejected message with no session ID');
+                return res.status(400).json({
+                    error: 'invalid_request',
+                    error_description: 'sessionId is required'
+                });
             }
+
+            const session = this.sessions.get(sessionId);
+            if (!session) {
+                console.error('[SSE] Rejected message for unknown session:', sessionId);
+                return res.status(404).json({
+                    error: 'not_found',
+                    error_description: 'No active SSE session with that ID'
+                });
+            }
+
+            session.transport.handlePostMessage(req, res);
         });
 
         // Error handling middleware. The exception message can carry paths, library

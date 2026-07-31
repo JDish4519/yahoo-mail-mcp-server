@@ -65,3 +65,4 @@ temp/
 .access.testable.mjs
 .limits.testable.mjs
 .folder.testable.mjs
+.session.testable.mjs

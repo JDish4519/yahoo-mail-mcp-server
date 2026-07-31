@@ -2,9 +2,11 @@
 # Multi-stage build for optimized production image
 # Works on both Windows Docker Desktop and Linux Docker
 
-FROM node:24-alpine AS base
+FROM node:24-alpine AS builder
 
-# Install dependencies needed for native modules
+# Toolchain for building any native modules. Confined to this stage: the previous
+# `FROM base AS production` inherited it, so the compilers shipped in the running
+# image even though the build was already multi-stage.
 RUN apk add --no-cache \
     python3 \
     make \
@@ -13,15 +15,18 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Copy package files
 COPY package*.json ./
 
-FROM base AS production
-
-# Install production dependencies only (package files already copied in base)
+# Install production dependencies only
 RUN npm ci --omit=dev
 
-# Copy application code
+FROM node:24-alpine AS production
+
+WORKDIR /app
+
+# Only the built dependency tree and the app itself cross the stage boundary.
+COPY --from=builder /app/node_modules ./node_modules
+COPY package*.json ./
 COPY server.js ./
 
 # Create a non-root user for security

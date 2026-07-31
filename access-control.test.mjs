@@ -176,6 +176,35 @@ for (const host of badHosts) {
     check('allowed Host -> not 403'.padEnd(56), status !== 403, `status ${status}`);
 }
 
+// --- token endpoint throttling ---------------------------------------------
+console.log('\n--- /oauth/token throttles credential guessing ---');
+{
+    // Wrong secret, repeatedly: what a brute-force attempt looks like.
+    const guess = () => fetch(`${BASE}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            grant_type: 'client_credentials',
+            client_id: CLIENT_ID,
+            client_secret: 'wrong-secret'
+        })
+    });
+
+    const statuses = [];
+    for (let i = 0; i < 30; i++) statuses.push((await guess()).status);
+
+    const rejected = statuses.filter(s => s === 401).length;
+    const throttled = statuses.filter(s => s === 429).length;
+
+    check('bad credentials rejected'.padEnd(46), rejected > 0, `${rejected} x 401`);
+    check('sustained guessing gets throttled'.padEnd(46), throttled > 0, `${throttled} x 429`);
+    check('throttle kicks in after a usable allowance'.padEnd(46), rejected >= 15, `only ${rejected} allowed`);
+
+    const limited = await guess();
+    check('429 carries Retry-After'.padEnd(46), limited.headers.get('retry-after') !== null,
+        `headers: ${[...limited.headers.keys()].join(',')}`);
+}
+
 // --- auth still enforced ---------------------------------------------------
 console.log('\n--- unauthenticated MCP access still refused ---');
 {

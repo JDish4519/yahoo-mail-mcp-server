@@ -54,6 +54,10 @@ const MAX_SEARCH_STRING_LENGTH = 256;
 
 // read_email pulls whole messages, attachments included, into memory. Without a
 // ceiling on both the count and the total bytes, one call can exhaust the heap.
+// IMAP mailbox names are bounded in practice; anything longer is a malformed or
+// manipulated argument rather than a real folder.
+const MAX_FOLDER_NAME_LENGTH = 256;
+
 const MAX_READ_BATCH = 20;
 const MAX_TOTAL_READ_BYTES = 25 * 1024 * 1024;  // 25 MB across the whole call
 
@@ -538,9 +542,14 @@ class YahooMailMCPServer {
             };
         }
 
-        const imap = await this.createImapConnection();
+        const folderError = this.validateFolderName(folder);
+        if (folderError) {
+            return {
+                content: [{ type: 'text', text: `Error: ${folderError}` }]
+            };
+        }
 
-        return new Promise((resolve, reject) => {
+        return this.withImapConnection((imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -580,14 +589,24 @@ class YahooMailMCPServer {
                     return;
                 }
 
-                // Fetch with struct for attachments and size
-                const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
-                    bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true,
-                    // node-imap only asks for RFC822.SIZE when told to, so without
-                    // this attrs.size is undefined and every email reports 0 bytes.
-                    size: true
-                });
+                // Fetch with struct for attachments and size.
+                // node-imap can throw here rather than emitting an error, and this
+                // runs on a later tick than withImapConnection's try/catch, so an
+                // escape would crash the process and orphan the socket.
+                let fetch;
+                try {
+                    fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
+                        bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
+                        struct: true,
+                        // node-imap only asks for RFC822.SIZE when told to, so
+                        // without this attrs.size is undefined and every email
+                        // reports 0 bytes.
+                        size: true
+                    });
+                } catch (fetchErr) {
+                    reject(fetchErr);
+                    return;
+                }
 
                 const emails = [];
 
@@ -718,9 +737,14 @@ class YahooMailMCPServer {
             };
         }
 
-        const imap = await this.createImapConnection();
+        const folderError = this.validateFolderName(folder);
+        if (folderError) {
+            return {
+                content: [{ type: 'text', text: `Error: ${folderError}` }]
+            };
+        }
 
-        return new Promise((resolve, reject) => {
+        return this.withImapConnection((imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {
                 if (err) {
                     imap.end();
@@ -783,7 +807,9 @@ class YahooMailMCPServer {
                 }
 
                 // CRITICAL: imap.search() returns UIDs by default (NOT sequence numbers)
-                imap.search(criteria, (err, results) => {
+                // Wrapped for the same reason as the fetch calls: a throw on this
+                // tick escapes withImapConnection's try/catch.
+                const runSearch = () => imap.search(criteria, (err, results) => {
                     if (err) {
                         imap.end();
                         reject(err);
@@ -806,11 +832,18 @@ class YahooMailMCPServer {
                     const limitedResults = results.slice(-count);
 
                     // Fetch details for these UIDs
-                    const fetch = imap.fetch(limitedResults, {
-                        bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true,
-                        size: true
-                    });
+                    let fetch;
+                    try {
+                        fetch = imap.fetch(limitedResults, {
+                            bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
+                            struct: true,
+                            size: true
+                        });
+                    } catch (fetchErr) {
+                        imap.end();
+                        reject(fetchErr);
+                        return;
+                    }
 
                     const emails = [];
 
@@ -864,6 +897,12 @@ class YahooMailMCPServer {
                         }));
                     });
                 });
+
+                try {
+                    runSearch();
+                } catch (searchErr) {
+                    reject(searchErr);
+                }
             });
         });
     }
@@ -908,6 +947,13 @@ class YahooMailMCPServer {
             };
         }
 
+        const folderError = this.validateFolderName(folder);
+        if (folderError) {
+            return {
+                content: [{ type: 'text', text: `Error: ${folderError}` }]
+            };
+        }
+
         // Cap destructive batches. Flag and read/unread changes are trivially
         // reversible and stay uncapped.
         if (options.destructive && uids.length > MAX_DESTRUCTIVE_BATCH) {
@@ -921,9 +967,7 @@ class YahooMailMCPServer {
             };
         }
 
-        const imap = await this.createImapConnection();
-
-        return new Promise((resolve, reject) => {
+        return this.withImapConnection((imap, resolve, reject) => {
             imap.openBox(folder, false, (err, box) => {  // false = read-write mode
                 if (err) {
                     imap.end();
@@ -966,18 +1010,27 @@ class YahooMailMCPServer {
                     const uid = uids[processedCount];
                     processedCount++;
 
-                    // Execute the UID-based operation for this single UID
-                    operation(imap, uid.toString(), (err) => {
-                        if (err) {
-                            console.error(`[UID ${uid}] Failed to ${operationName}:`, err.message);
-                            failedUIDs.push(uid);
-                        } else {
-                            successfulUIDs.push(uid);
-                        }
+                    // Execute the UID-based operation for this single UID.
+                    // node-imap throws rather than calling back for some argument
+                    // errors, and from the second UID onward this runs inside an
+                    // async callback, past withImapConnection's try/catch.
+                    try {
+                        operation(imap, uid.toString(), (err) => {
+                            if (err) {
+                                console.error(`[UID ${uid}] Failed to ${operationName}:`, err.message);
+                                failedUIDs.push(uid);
+                            } else {
+                                successfulUIDs.push(uid);
+                            }
 
-                        // Continue to next UID (don't stop on errors)
+                            // Continue to next UID (don't stop on errors)
+                            processNextUID();
+                        });
+                    } catch (opErr) {
+                        console.error(`[UID ${uid}] ${operationName} threw:`, opErr.message);
+                        failedUIDs.push(uid);
                         processNextUID();
-                    });
+                    }
                 };
 
                 // Start processing
@@ -1001,6 +1054,13 @@ class YahooMailMCPServer {
             };
         }
 
+        const folderError = this.validateFolderName(folder);
+        if (folderError) {
+            return {
+                content: [{ type: 'text', text: `Error: ${folderError}` }]
+            };
+        }
+
         // Unlike the destructive operations, this one is capped for memory rather
         // than blast radius: every message is pulled whole, attachments included.
         if (uids.length > MAX_READ_BATCH) {
@@ -1013,9 +1073,7 @@ class YahooMailMCPServer {
             };
         }
 
-        const imap = await this.createImapConnection();
-
-        return new Promise((resolve, reject) => {
+        return this.withImapConnection((imap, resolve, reject) => {
             imap.openBox(folder, true, (err, box) => {  // true = read-only mode
                 if (err) {
                     imap.end();
@@ -1026,11 +1084,17 @@ class YahooMailMCPServer {
                 const source = uids.join(',');
 
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
-                const fetch = imap.fetch(source, {
-                    bodies: '',
-                    struct: true,
-                    size: true
-                });
+                let fetch;
+                try {
+                    fetch = imap.fetch(source, {
+                        bodies: '',
+                        struct: true,
+                        size: true
+                    });
+                } catch (fetchErr) {
+                    reject(fetchErr);
+                    return;
+                }
 
                 const emails = [];
                 const foundUIDs = new Set();
@@ -1259,6 +1323,15 @@ class YahooMailMCPServer {
      * Move emails to a specific folder
      */
     async moveEmails(uids, folderName, sourceFolder = 'INBOX') {
+        // The destination reaches imap.move() rather than openBox(), so it needs
+        // checking here; modifyEmails only sees the source folder.
+        const destError = this.validateFolderName(folderName, 'folderName');
+        if (destError) {
+            return {
+                content: [{ type: 'text', text: `Error: ${destError}` }]
+            };
+        }
+
         return this.modifyEmails(
             uids,
             (imap, source, callback) => imap.move(source, folderName, callback),  // NO .seq
@@ -1416,6 +1489,85 @@ class YahooMailMCPServer {
     }
 
     /**
+     * Helper: Validate a mailbox name before it reaches the IMAP command builder
+     *
+     * Folder names went straight into SELECT/EXAMINE/MOVE while query and sender
+     * were carefully checked. That held only by accident: utf7.encode() throws on
+     * a control character, so CRLF never reached the command stream. Relying on a
+     * third-party encoder to throw is not a control, and the throw itself caused
+     * the leak this also fixes -- it fired after the connection was open, inside a
+     * promise executor, so imap.end() never ran and the socket was orphaned.
+     *
+     * @returns {string|null} Error message if invalid, null if valid
+     */
+    validateFolderName(value, fieldName = 'folder') {
+        if (typeof value !== 'string') {
+            return `${fieldName} must be a string`;
+        }
+
+        if (value.length === 0) {
+            return `${fieldName} cannot be empty`;
+        }
+
+        if (RE_CONTROL_CHARS.test(value)) {
+            return `${fieldName} cannot contain control characters`;
+        }
+
+        if (value.length > MAX_FOLDER_NAME_LENGTH) {
+            return `${fieldName} cannot exceed ${MAX_FOLDER_NAME_LENGTH} characters`;
+        }
+
+        return null;
+    }
+
+    /**
+     * Helper: Open a connection, run an operation, and always close the socket
+     *
+     * Every caller used to build its own promise around createImapConnection().
+     * A synchronous throw inside that executor -- which openBox can still do --
+     * escaped without imap.end(), orphaning the connection. Repeat that and you
+     * exhaust the account's concurrent IMAP connection limit.
+     */
+    async withImapConnection(operation) {
+        const imap = await this.createImapConnection();
+
+        // Operations still call imap.end() at their natural finishing points, and
+        // this helper closes again on the way out. Funnel both through one guard
+        // so the connection is closed exactly once, whichever gets there first.
+        const originalEnd = imap.end.bind(imap);
+        let closed = false;
+        const closeOnce = () => {
+            if (closed) return;
+            closed = true;
+            try {
+                originalEnd();
+            } catch (endErr) {
+                console.error('[IMAP] Error closing connection:', endErr.message);
+            }
+        };
+        imap.end = closeOnce;
+
+        return new Promise((resolve, reject) => {
+            let settled = false;
+
+            const finish = (err, value) => {
+                if (settled) return;
+                settled = true;
+                closeOnce();
+                if (err) reject(err); else resolve(value);
+            };
+
+            try {
+                operation(imap, (value) => finish(null, value), (err) => finish(err));
+            } catch (err) {
+                // openBox throws synchronously on a name utf7 cannot encode.
+                console.error('[IMAP] Operation threw synchronously:', err.message);
+                finish(err);
+            }
+        });
+    }
+
+    /**
      * Helper: Validate UIDs array
      */
     validateUIDs(uids) {
@@ -1450,9 +1602,7 @@ class YahooMailMCPServer {
      * List all available IMAP folders
      */
     async listFolders() {
-        const imap = await this.createImapConnection();
-
-        return new Promise((resolve, reject) => {
+        return this.withImapConnection((imap, resolve, reject) => {
             imap.getBoxes((err, boxes) => {
                 imap.end();
 

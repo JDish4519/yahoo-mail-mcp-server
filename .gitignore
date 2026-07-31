@@ -63,3 +63,4 @@ temp/
 .demo.mjs
 .disclosure.testable.mjs
 .access.testable.mjs
+.limits.testable.mjs

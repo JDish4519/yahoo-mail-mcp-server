@@ -52,6 +52,11 @@ const RE_CONTROL_CHARS = /[\x00-\x1F\x7F]/;
 // oversized IMAP command line.
 const MAX_SEARCH_STRING_LENGTH = 256;
 
+// read_email pulls whole messages, attachments included, into memory. Without a
+// ceiling on both the count and the total bytes, one call can exhaust the heap.
+const MAX_READ_BATCH = 20;
+const MAX_TOTAL_READ_BYTES = 25 * 1024 * 1024;  // 25 MB across the whole call
+
 // Preamble for a full email body. Kept verbatim -- it is what the model reads
 // before any sender-written text.
 const UNTRUSTED_EMAIL_NOTE =
@@ -578,18 +583,21 @@ class YahooMailMCPServer {
                 // Fetch with struct for attachments and size
                 const fetch = imap.seq.fetch(`${startSeq}:${endSeq}`, {
                     bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                    struct: true
+                    struct: true,
+                    // node-imap only asks for RFC822.SIZE when told to, so without
+                    // this attrs.size is undefined and every email reports 0 bytes.
+                    size: true
                 });
 
                 const emails = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let header = '';
+                    const headerChunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            header += chunk.toString('ascii');
+                            headerChunks.push(chunk);
                         });
                     });
 
@@ -598,7 +606,10 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        const parsed = Imap.parseHeader(header);
+                        // Decode once, as UTF-8. Concatenating chunk.toString('ascii')
+                        // stripped the high bit off every byte, so any non-ASCII
+                        // subject or sender name came back mangled.
+                        const parsed = Imap.parseHeader(Buffer.concat(headerChunks).toString('utf8'));
 
                         // from/subject/date are written by the sender, so they go
                         // through the same marker stripping read_email applies.
@@ -797,18 +808,19 @@ class YahooMailMCPServer {
                     // Fetch details for these UIDs
                     const fetch = imap.fetch(limitedResults, {
                         bodies: 'HEADER.FIELDS (FROM TO SUBJECT DATE)',
-                        struct: true
+                        struct: true,
+                        size: true
                     });
 
                     const emails = [];
 
                     fetch.on('message', (msg, seqno) => {
-                        let header = '';
+                        const headerChunks = [];
                         let attrs = null;
 
                         msg.on('body', (stream, info) => {
                             stream.on('data', (chunk) => {
-                                header += chunk.toString('ascii');
+                                headerChunks.push(chunk);
                             });
                         });
 
@@ -817,7 +829,7 @@ class YahooMailMCPServer {
                         });
 
                         msg.once('end', () => {
-                            const parsed = Imap.parseHeader(header);
+                            const parsed = Imap.parseHeader(Buffer.concat(headerChunks).toString('utf8'));
                             emails.push(this.sanitizeHeaderFields({
                                 uid: attrs.uid,
                                 sequenceNumber: seqno,
@@ -989,6 +1001,18 @@ class YahooMailMCPServer {
             };
         }
 
+        // Unlike the destructive operations, this one is capped for memory rather
+        // than blast radius: every message is pulled whole, attachments included.
+        if (uids.length > MAX_READ_BATCH) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: cannot read more than ${MAX_READ_BATCH} emails in one call ` +
+                          `(received ${uids.length}). Read them in smaller batches.`
+                }]
+            };
+        }
+
         const imap = await this.createImapConnection();
 
         return new Promise((resolve, reject) => {
@@ -1004,7 +1028,8 @@ class YahooMailMCPServer {
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
                 const fetch = imap.fetch(source, {
                     bodies: '',
-                    struct: true
+                    struct: true,
+                    size: true
                 });
 
                 const emails = [];
@@ -1013,14 +1038,24 @@ class YahooMailMCPServer {
                 // Nothing may resolve until all of these are done.
                 const parses = [];
                 const parseFailures = [];
+                let totalBytes = 0;
+                let overSized = false;
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];
                     let attrs = null;
 
                     msg.on('body', (stream, info) => {
                         stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
+                            // Counted across the whole call, not per message, so a
+                            // batch of large attachments cannot slip under the bar
+                            // one message at a time.
+                            totalBytes += chunk.length;
+                            if (totalBytes > MAX_TOTAL_READ_BYTES) {
+                                overSized = true;
+                                return;
+                            }
+                            chunks.push(chunk);
                         });
                     });
 
@@ -1030,8 +1065,15 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
+                        if (overSized) {
+                            return;
+                        }
+
                         parses.push(
-                            simpleParser(buffer)
+                            // Hand mailparser the raw bytes. Decoding to a string
+                            // first forced one charset onto every message; the MIME
+                            // headers say what each one actually uses.
+                            simpleParser(Buffer.concat(chunks))
                                 .then((parsed) => {
                                     emails.push({
                                         uid: attrs.uid,
@@ -1072,6 +1114,14 @@ class YahooMailMCPServer {
                     // because the missing-UID check below reads foundUIDs, which is
                     // populated synchronously and so never noticed.
                     await Promise.all(parses);
+
+                    if (overSized) {
+                        reject(new Error(
+                            `Requested emails exceed the ${Math.round(MAX_TOTAL_READ_BYTES / 1024 / 1024)}MB ` +
+                            `limit for a single read. Read fewer UIDs at a time.`
+                        ));
+                        return;
+                    }
 
                     // Check for missing UIDs
                     const missingUIDs = uids.filter(uid => !foundUIDs.has(uid));

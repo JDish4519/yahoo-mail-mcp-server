@@ -1714,15 +1714,87 @@ class YahooMailMCPServer {
     }
 
     /**
+     * Helper: Whether tokens are self-verifying (signed) instead of looked up
+     * in memory
+     *
+     * Gated on TOKEN_SIGNING_SECRET being set. Unset -- the default -- nothing
+     * about issuing or verifying a token changes from before this existed. A
+     * spin-down that restarts the process wipes validTokens/validRefreshTokens
+     * either way; the difference is only whether that wipe matters.
+     */
+    statelessTokensEnabled() {
+        return !!process.env.TOKEN_SIGNING_SECRET;
+    }
+
+    /**
+     * Helper: Sign a token payload so verifying it needs no lookup
+     *
+     * The payload IS the token's state -- client_id, scope, expiry, and which
+     * of access/refresh it is -- so a restart that empties the in-memory Maps
+     * does not invalidate it. Verification recomputes the HMAC instead of
+     * checking a Map, which is what lets a token survive a Render spin-down
+     * with no external store. Same shape as a JWT; hand-rolled rather than a
+     * dependency because the pieces (HMAC, base64url, constant-time compare)
+     * already exist in this file for the PKCE check below.
+     */
+    signStatelessToken(payload) {
+        const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+        const signature = crypto.createHmac('sha256', process.env.TOKEN_SIGNING_SECRET)
+            .update(payloadB64)
+            .digest('base64url');
+        return `${payloadB64}.${signature}`;
+    }
+
+    /**
+     * Helper: Verify and decode a signed token
+     *
+     * Checks the signature in constant time, then the token's own declared
+     * type and expiry. The type check matters: access and refresh tokens are
+     * signed with the same secret, so without it a valid access token would
+     * also verify as a refresh token and vice versa.
+     *
+     * @returns {{client_id: string, scope: string, expiresAt: number}|null}
+     */
+    verifyStatelessToken(token, expectedType) {
+        if (typeof token !== 'string') return null;
+
+        const parts = token.split('.');
+        if (parts.length !== 2) return null;
+        const [payloadB64, signature] = parts;
+
+        const expectedSignature = crypto.createHmac('sha256', process.env.TOKEN_SIGNING_SECRET)
+            .update(payloadB64)
+            .digest('base64url');
+        if (!this.constantTimeEquals(signature, expectedSignature)) return null;
+
+        let payload;
+        try {
+            payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+        } catch {
+            return null;
+        }
+
+        if (payload.typ !== expectedType) return null;
+        if (typeof payload.expiresAt !== 'number' || payload.expiresAt <= Date.now()) return null;
+
+        return { client_id: payload.client_id, scope: payload.scope, expiresAt: payload.expiresAt };
+    }
+
+    /**
      * Helper: Mint an access token that actually stops working when it expires
      */
     issueAccessToken(clientId, scope) {
+        const expiresAt = Date.now() + ACCESS_TOKEN_TTL_MS;
+        const resolvedScope = scope || 'mcp';
+
+        if (this.statelessTokensEnabled()) {
+            return this.signStatelessToken({
+                typ: 'access', client_id: clientId, scope: resolvedScope, expiresAt
+            });
+        }
+
         const token = crypto.randomBytes(32).toString('base64url');
-        this.validTokens.set(token, {
-            client_id: clientId,
-            scope: scope || 'mcp',
-            expiresAt: Date.now() + ACCESS_TOKEN_TTL_MS
-        });
+        this.validTokens.set(token, { client_id: clientId, scope: resolvedScope, expiresAt });
         return token;
     }
 
@@ -1730,13 +1802,43 @@ class YahooMailMCPServer {
      * Helper: Mint a refresh token
      */
     issueRefreshToken(clientId, scope) {
+        const expiresAt = Date.now() + REFRESH_TOKEN_TTL_MS;
+        const resolvedScope = scope || 'mcp';
+
+        if (this.statelessTokensEnabled()) {
+            return this.signStatelessToken({
+                typ: 'refresh', client_id: clientId, scope: resolvedScope, expiresAt
+            });
+        }
+
         const token = crypto.randomBytes(32).toString('base64url');
-        this.validRefreshTokens.set(token, {
-            client_id: clientId,
-            scope: scope || 'mcp',
-            expiresAt: Date.now() + REFRESH_TOKEN_TTL_MS
-        });
+        this.validRefreshTokens.set(token, { client_id: clientId, scope: resolvedScope, expiresAt });
         return token;
+    }
+
+    /**
+     * Helper: Look up a refresh token and, in memory mode, burn it
+     *
+     * Stateless tokens are not single-use: verifying one does not invalidate
+     * it, since there is nowhere to record that it already happened. Accepted
+     * trade-off -- see the stateless-token section of the README.
+     *
+     * @returns {{client_id: string, scope: string, expiresAt: number}|null}
+     */
+    consumeRefreshToken(token) {
+        if (!token) return null;
+
+        if (this.statelessTokensEnabled()) {
+            return this.verifyStatelessToken(token, 'refresh');
+        }
+
+        const data = this.validRefreshTokens.get(token);
+        if (!data) return null;
+
+        // One-time use: burn now so a replay cannot race a second exchange
+        // past the expiry check the caller runs next.
+        this.validRefreshTokens.delete(token);
+        return data;
     }
 
     /**
@@ -1930,7 +2032,10 @@ class YahooMailMCPServer {
             // Validate token and enforce its lifetime. Without the expiry check the
             // advertised expires_in is decorative and every token ever issued stays
             // usable until the process restarts.
-            const tokenData = this.validTokens.get(token);
+            const tokenData = this.statelessTokensEnabled()
+                ? this.verifyStatelessToken(token, 'access')
+                : this.validTokens.get(token);
+
             if (!tokenData) {
                 console.error('[Auth] Invalid access token');
                 return res.status(401).json({
@@ -1939,8 +2044,11 @@ class YahooMailMCPServer {
                 });
             }
 
+            // verifyStatelessToken already checked expiry, so this only fires in
+            // memory mode -- guarded so it does not delete from a map stateless
+            // mode never wrote to.
             if (tokenData.expiresAt <= Date.now()) {
-                this.validTokens.delete(token);
+                if (!this.statelessTokensEnabled()) this.validTokens.delete(token);
                 console.error('[Auth] Expired access token rejected');
                 return res.status(401).json({
                     error: 'invalid_token',
@@ -2243,7 +2351,7 @@ class YahooMailMCPServer {
 
                 console.error('[OAuth] Refresh token grant - validating token');
 
-                const refreshData = refresh_token ? this.validRefreshTokens.get(refresh_token) : null;
+                const refreshData = this.consumeRefreshToken(refresh_token);
                 if (!refreshData) {
                     console.error('[OAuth] Invalid or expired refresh token');
                     return res.status(400).json({
@@ -2252,9 +2360,8 @@ class YahooMailMCPServer {
                     });
                 }
 
-                // Rotate refresh token (one-time use) and issue a new access token
-                this.validRefreshTokens.delete(refresh_token);
-
+                // verifyStatelessToken already checked expiry, so this only
+                // fires in memory mode.
                 if (refreshData.expiresAt <= Date.now()) {
                     console.error('[OAuth] Refresh token expired');
                     return res.status(400).json({

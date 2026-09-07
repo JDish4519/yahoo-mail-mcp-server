@@ -479,6 +479,7 @@ docker ps
 | `OAUTH_CLIENT_SECRET` | Yes (Remote) | - | OAuth 2.0 client secret for MCP server authentication (generate with `openssl rand -hex 32`) |
 | `MCP_ALLOWED_HOSTS` | No | Render hostname, else `localhost:PORT` | Comma-separated `Host` header values accepted on `/mcp/*`. Set this behind a custom domain |
 | `MCP_ALLOWED_ORIGINS` | No | - | Comma-separated extra browser origins allowed to call the server. `https://claude.ai` and `https://claude.com` are always allowed |
+| `TOKEN_SIGNING_SECRET` | No | - | Makes OAuth tokens self-verifying so they survive a restart (generate with `openssl rand -hex 32`). See [Surviving a Render spin-down](#surviving-a-render-spin-down) |
 | `TRANSPORT_MODE` | No | `stdio` | Transport mode: `stdio` or `sse` |
 | `PORT` | No | `3000` | Port for SSE mode (auto-set by Render) |
 | `NODE_ENV` | No | `development` | Environment: `development` or `production` |
@@ -486,6 +487,23 @@ docker ps
 **Note**: `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET` are only required for remote deployments (Render.com). Local stdio mode doesn't require OAuth.
 
 **The server exits with status 1 if either is missing while `TRANSPORT_MODE=sse`.** It will not fall back to running unauthenticated: an SSE deployment without OAuth is an anonymous, internet-facing mailbox that anyone who finds the URL can read and delete from. If a Render deploy fails at boot with `FATAL: OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET are required`, set both in Settings > Environment.
+
+## Surviving a Render spin-down
+
+Render's free tier stops the process after 15 minutes idle and cold-starts it on the next request. By default, that also invalidates every OAuth token: access and refresh tokens live in an in-memory `Map`, reset fresh when the process starts, so a client holding a token minted before the spin-down gets a `401` after it and has to re-authorize from scratch.
+
+Setting `TOKEN_SIGNING_SECRET` changes what a token *is*. Instead of a random string looked up in that `Map`, a token becomes its own claims (`client_id`, `scope`, expiry, and whether it's an access or refresh token) signed with the secret. Verifying it means recomputing the signature, not checking a store -- so as long as the secret itself persists (a Render environment variable does, across restarts), a token minted before a spin-down still verifies after one. The client sees a cold-start delay, not a dropped connection.
+
+```bash
+# Generate once, then set in the Render Dashboard (Settings > Environment):
+openssl rand -hex 32
+```
+
+Leave it unset and nothing changes -- this is off by default, and turning it on doesn't touch `YAHOO_EMAIL`, `YAHOO_APP_PASSWORD`, `OAUTH_CLIENT_ID`, or `OAUTH_CLIENT_SECRET`.
+
+**The trade-off:** a signed token can't be revoked before its own expiry short of rotating the secret, which invalidates every token at once, not just one. Refresh tokens specifically also stop being single-use -- verifying one doesn't burn it, since there's nowhere to record that it happened, so the same refresh token stays valid for its full 30-day life if it leaks. Given the server already rests on one shared `OAUTH_CLIENT_SECRET` that alone can mint tokens via `client_credentials`, this isn't a large step down from the existing trust model, but it is a real one -- decide deliberately rather than by default.
+
+Access tokens (1 hour) and authorization codes (5 minutes, single-use, still in memory regardless of this setting) are short-lived enough that the trade-off mostly concerns the 30-day refresh token.
 
 ## Available npm Scripts
 

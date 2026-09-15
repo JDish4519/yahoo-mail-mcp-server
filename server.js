@@ -1905,11 +1905,36 @@ class YahooMailMCPServer {
         // Don't advertise the framework in every response header
         app.disable('x-powered-by');
 
-        // Trust exactly one proxy hop. Render terminates TLS and sets
-        // X-Forwarded-For; without this req.ip is the proxy's address and every
-        // client shares one rate-limit bucket. Trusting one hop rather than all
-        // means a caller cannot pick their own bucket by prepending addresses.
-        app.set('trust proxy', 1);
+        // Render's real path to this app is two hops, not one: Cloudflare's edge,
+        // then Render's own internal load balancer (a private 10.x address).
+        // "trust proxy: 1" skipped only the first, so req.ip resolved to Render's
+        // internal LB -- the same constant for every caller. That collapsed the
+        // per-IP token rate limiter below into a single global bucket: because it
+        // runs before credential validation, anyone could spend all 20 attempts a
+        // minute with junk credentials and lock the real client out of renewing
+        // its access token. Verified by replaying a captured Render chain.
+        //
+        // Trust specific known ranges instead of a hop count: RFC1918 (Render's
+        // internal LB) via Express's built-in 'uniquelocal', plus Cloudflare's
+        // published edge ranges. proxy-addr walks through however many
+        // consecutive trusted-range hops it finds and stops at the first address
+        // that is neither, which is the real client -- so this keeps working if
+        // the chain ever changes length, and a caller still cannot choose their
+        // own bucket by prepending addresses (anything to the left of the first
+        // untrusted hop is never consulted).
+        const CLOUDFLARE_IPV4_RANGES = [
+            '173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22',
+            '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20',
+            '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13',
+            '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'
+        ];
+        const CLOUDFLARE_IPV6_RANGES = [
+            '2400:cb00::/32', '2606:4700::/32', '2803:f800::/32', '2405:b500::/32',
+            '2405:8100::/32', '2a06:98c0::/29', '2c0f:f248::/32'
+        ];
+        app.set('trust proxy', [
+            'loopback', 'uniquelocal', ...CLOUDFLARE_IPV4_RANGES, ...CLOUDFLARE_IPV6_RANGES
+        ]);
 
         // Log startup configuration
         console.error('[Server] Starting in SSE mode');
